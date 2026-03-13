@@ -401,7 +401,7 @@ float *iris_sample_euler_zimage(void *transformer,
 
         /* The transformer timestep is (1 - sigma), matching the Python pipeline:
          * pipeline: timestep = (1000 - t_scheduler) / 1000 = 1 - sigma
-         * transformer: t = timestep * t_scale (1000) -> sinusoidal_input */
+         * zi_timestep_embed scales this by t_scale=1000 internally before sinusoidal. */
         float timestep = 1.0f - sigma;
 
         double step_start = get_time_ms();

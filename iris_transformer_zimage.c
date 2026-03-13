@@ -543,8 +543,8 @@ static void zi_rms_norm(float *out, const float *x, const float *weight,
 
 /* Converts scalar timestep to a 256-dim vector using log-spaced frequencies,
  * the same idea as the original Transformer positional encoding but here it
- * encodes the denoising step. The caller scales the input by 1000 before
- * calling (t * 1000.0f), mapping the [0,1] sigma range to [0,1000]. */
+ * encodes the denoising step. Input t is (1-sigma) in [0,1]; scaled by 1000
+ * (t_scale=1000 from model config) before sinusoidal, matching Python. */
 static void zi_sinusoidal_embedding(float *out, float t, int dim) {
     int half = dim / 2;
     float log_max_period = logf(10000.0f);
@@ -681,10 +681,11 @@ static void zi_qk_norm(float *x, const float *norm_weight, int seq,
 }
 
 /* Scaled dot-product self-attention on the CPU path.
- * Computes Q@K^T per head, applies padding mask (sets masked positions to
- * -1e9 so softmax zeros them out), then scores@V. The mask distinguishes
- * real tokens from padding in the sequence. This is the slow reference path;
- * the GPU path uses fused SDPA kernels instead. */
+ * Computes Q@K^T per head, optionally applies a mask, then scores@V.
+ * mask=NULL means no masking (all positions attend freely, matching the
+ * Python training behavior where pad tokens use learned embeddings and
+ * participate in attention). This is the slow reference path; the GPU path
+ * uses fused SDPA kernels instead. */
 static void zi_attention(float *out, const float *x,
                           const zi_block_t *block, const int *pos_ids,
                           const int *mask, int seq,
@@ -712,7 +713,11 @@ static void zi_attention(float *out, const float *x,
 
     /* Scaled dot-product attention per head */
     float scale = 1.0f / sqrtf((float)head_dim);
-    float *attn_out = tf->work_tmp;
+    /* Use work_ffn as scratch (allocated ffn_dim*seq*2, larger than dim*seq).
+     * work_tmp is passed by the caller as 'out', so we must not alias it here
+     * or the final iris_matmul_t(out, attn_out, ...) would be an in-place BLAS
+     * call with A==C, which is undefined behavior. */
+    float *attn_out = tf->work_ffn;
 
     for (int h = 0; h < n_heads; h++) {
         float *scores = tf->work_attn;
@@ -1686,8 +1691,9 @@ static void zi_unpatchify(float *latent, const float *patches,
  * ======================================================================== */
 
 /* Top-level Z-Image transformer entry point. Tries GPU path first, falls
- * back to CPU on failure. CPU path pads sequences to multiples of 32 and
- * uses padding masks. Pipeline: patchify -> embed image/caption ->
+ * back to CPU on failure. CPU path pads sequences to multiples of 32; padding
+ * positions use learned pad tokens and attend freely (no masking). Pipeline:
+ * patchify -> embed image/caption ->
  * noise refiner (image self-attention) -> context refiner (caption
  * self-attention) -> concatenate [image, caption] -> main blocks (full
  * self-attention) -> final layer -> unpatchify. */
@@ -1859,33 +1865,9 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         cap_pos[s * 3 + 2] = 0;       /* W */
     }
 
-    /* Image and caption masks */
-    int *img_mask = (int *)malloc(img_padded * sizeof(int));
-    if (!img_mask) {
-        free(img_emb);
-        free(cap_emb);
-        free(img_pos);
-        free(cap_pos);
-        return NULL;
-    }
-    for (int i = 0; i < img_seq; i++) img_mask[i] = 1;
-    for (int i = img_seq; i < img_padded; i++) img_mask[i] = 0;
-
-    int *cap_mask = (int *)malloc(cap_padded * sizeof(int));
-    if (!cap_mask) {
-        free(img_emb);
-        free(cap_emb);
-        free(img_pos);
-        free(cap_pos);
-        free(img_mask);
-        return NULL;
-    }
-    for (int i = 0; i < cap_seq_len; i++) cap_mask[i] = 1;
-    for (int i = cap_seq_len; i < cap_padded; i++) cap_mask[i] = 0;
-
     /* 5. Noise refiner: image-only self-attention with modulation */
     for (int i = 0; i < tf->n_refiner; i++) {
-        zi_block_forward(img_emb, &tf->noise_refiner[i], img_pos, img_mask,
+        zi_block_forward(img_emb, &tf->noise_refiner[i], img_pos, NULL,
                           t_emb, img_padded, tf);
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, i, refiner_total);
@@ -1893,7 +1875,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
 
     /* 6. Context refiner: caption-only self-attention without modulation */
     for (int i = 0; i < tf->n_refiner; i++) {
-        zi_block_forward(cap_emb, &tf->context_refiner[i], cap_pos, cap_mask,
+        zi_block_forward(cap_emb, &tf->context_refiner[i], cap_pos, NULL,
                           NULL, cap_padded, tf);
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, tf->n_refiner + i, refiner_total);
@@ -1911,8 +1893,6 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
     if (!unified_pos) {
         free(img_pos);
         free(cap_pos);
-        free(img_mask);
-        free(cap_mask);
         return NULL;
     }
     memcpy(unified_pos, img_pos, img_padded * 3 * sizeof(int));
@@ -1920,29 +1900,15 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
     free(img_pos);
     free(cap_pos);
 
-    /* Unified mask */
-    int *unified_mask = (int *)malloc(unified_seq * sizeof(int));
-    if (!unified_mask) {
-        free(unified_pos);
-        free(img_mask);
-        free(cap_mask);
-        return NULL;
-    }
-    memcpy(unified_mask, img_mask, img_padded * sizeof(int));
-    memcpy(unified_mask + img_padded, cap_mask, cap_padded * sizeof(int));
-    free(img_mask);
-    free(cap_mask);
-
     /* 8. Main transformer layers */
     for (int i = 0; i < tf->n_layers; i++) {
-        zi_block_forward(unified, &tf->layers[i], unified_pos, unified_mask,
+        zi_block_forward(unified, &tf->layers[i], unified_pos, NULL,
                           t_emb, unified_seq, tf);
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->n_layers);
     }
 
     free(unified_pos);
-    free(unified_mask);
 
     /* 9. Final layer: extract image tokens only, then project */
     float *img_out = (float *)malloc(img_seq * dim * sizeof(float));
