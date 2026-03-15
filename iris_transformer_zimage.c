@@ -28,6 +28,8 @@
 #else
 #include <cblas.h>
 #endif
+#include <pthread.h>
+#include <unistd.h>
 #endif
 
 #ifdef USE_METAL
@@ -680,6 +682,66 @@ static void zi_qk_norm(float *x, const float *norm_weight, int seq,
     }
 }
 
+/* ========================================================================
+ * Thread-parallel attention for BLAS path.
+ * Per-head sgemm is too small for BLAS internal threading, so we
+ * parallelize across heads using pthreads instead.
+ * ======================================================================== */
+
+#ifdef USE_BLAS
+typedef struct {
+    const float *q, *k, *v;
+    float *attn_out, *scores;
+    const int *mask;
+    int seq, head_dim, dim;
+    float scale;
+    int head_start, head_end;
+} zi_attn_thread_work_t;
+
+static void *zi_attn_thread_worker(void *arg) {
+    zi_attn_thread_work_t *w = (zi_attn_thread_work_t *)arg;
+    for (int h = w->head_start; h < w->head_end; h++) {
+        const float *qh = w->q + h * w->head_dim;
+        const float *kh = w->k + h * w->head_dim;
+        const float *vh = w->v + h * w->head_dim;
+        float *oh = w->attn_out + h * w->head_dim;
+        float *sh = w->scores + (size_t)h * w->seq * w->seq;
+
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    w->seq, w->seq, w->head_dim,
+                    w->scale, qh, w->dim, kh, w->dim,
+                    0.0f, sh, w->seq);
+
+        if (w->mask) {
+            for (int i = 0; i < w->seq; i++)
+                for (int j = 0; j < w->seq; j++)
+                    if (!w->mask[j])
+                        sh[i * w->seq + j] = -1e9f;
+        }
+
+        iris_softmax(sh, w->seq, w->seq);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    w->seq, w->head_dim, w->seq,
+                    1.0f, sh, w->seq, vh, w->dim,
+                    0.0f, oh, w->dim);
+    }
+    return NULL;
+}
+
+/* Get number of threads for head-parallel attention.
+ * Uses CPU core count, capped to divide n_heads evenly. */
+static int zi_get_attn_num_threads(int heads) {
+    static int cached = 0;
+    if (cached) return cached;
+    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 2) { cached = 1; return 1; }
+    if (ncpu > heads) ncpu = heads;
+    while (heads % ncpu != 0) ncpu--;
+    cached = ncpu;
+    return cached;
+}
+#endif /* USE_BLAS */
+
 /* Scaled dot-product self-attention on the CPU path.
  * Computes Q@K^T per head, optionally applies a mask, then scores@V.
  * mask=NULL means no masking (all positions attend freely, matching the
@@ -719,6 +781,65 @@ static void zi_attention(float *out, const float *x,
      * call with A==C, which is undefined behavior. */
     float *attn_out = tf->work_ffn;
 
+#ifdef USE_BLAS
+    /* BLAS path: thread-parallel per-head attention.
+     * Q, K, V are [seq, n_heads*head_dim] layout. We use dim as row stride to
+     * read head_dim elements per head per row directly.
+     * Per-head sgemm is too small for BLAS internal threading, so we
+     * parallelize across heads with pthreads for better core utilization.
+     * work_attn is [n_heads, seq, seq] so each thread has its own scores slice. */
+    {
+        int nthreads = zi_get_attn_num_threads(n_heads);
+        int heads_per_thread = n_heads / nthreads;
+        float *scores = tf->work_attn; /* [n_heads, seq, seq] */
+
+        if (nthreads <= 1) {
+            for (int h = 0; h < n_heads; h++) {
+                const float *qh = q + h * head_dim;
+                const float *kh = k + h * head_dim;
+                const float *vh = v + h * head_dim;
+                float *oh = attn_out + h * head_dim;
+                float *sh = scores + (size_t)h * seq * seq;
+
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            seq, seq, head_dim,
+                            scale, qh, dim, kh, dim,
+                            0.0f, sh, seq);
+                if (mask) {
+                    for (int i = 0; i < seq; i++)
+                        for (int j = 0; j < seq; j++)
+                            if (!mask[j])
+                                sh[i * seq + j] = -1e9f;
+                }
+                iris_softmax(sh, seq, seq);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            seq, head_dim, seq,
+                            1.0f, sh, seq, vh, dim,
+                            0.0f, oh, dim);
+            }
+        } else {
+            pthread_t threads[nthreads];
+            zi_attn_thread_work_t work[nthreads];
+            int ok[nthreads];
+            for (int t = 0; t < nthreads; t++) {
+                work[t] = (zi_attn_thread_work_t){
+                    .q = q, .k = k, .v = v,
+                    .attn_out = attn_out, .scores = scores,
+                    .mask = mask,
+                    .seq = seq, .head_dim = head_dim, .dim = dim,
+                    .scale = scale,
+                    .head_start = t * heads_per_thread,
+                    .head_end = (t + 1) * heads_per_thread,
+                };
+                ok[t] = pthread_create(&threads[t], NULL, zi_attn_thread_worker, &work[t]) == 0;
+                if (!ok[t]) zi_attn_thread_worker(&work[t]);
+            }
+            for (int t = 0; t < nthreads; t++) {
+                if (ok[t]) pthread_join(threads[t], NULL);
+            }
+        }
+    }
+#else
     for (int h = 0; h < n_heads; h++) {
         float *scores = tf->work_attn;
 
@@ -759,6 +880,7 @@ static void zi_attention(float *out, const float *x,
             }
         }
     }
+#endif /* USE_BLAS */
 
     /* Output projection */
     iris_matmul_t(out, attn_out, block->attn_out_weight, seq, dim, dim);
@@ -1734,7 +1856,11 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
     /* Ensure working memory is sufficient */
     size_t needed = (size_t)unified_seq * dim * 4 +
                     (size_t)unified_seq * dim * 3 +  /* QKV */
+#ifdef USE_BLAS
+                    (size_t)tf->n_heads * unified_seq * unified_seq + /* attention scores (per-head) */
+#else
                     (size_t)unified_seq * unified_seq + /* attention scores */
+#endif
                     (size_t)unified_seq * tf->ffn_dim * 2;
     if (needed > tf->work_alloc) {
         free(tf->work_x);
@@ -1745,7 +1871,11 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         tf->work_x = (float *)malloc(unified_seq * dim * sizeof(float));
         tf->work_tmp = (float *)malloc(unified_seq * dim * 4 * sizeof(float));
         tf->work_qkv = (float *)malloc(unified_seq * dim * 3 * sizeof(float));
+#ifdef USE_BLAS
+        tf->work_attn = (float *)malloc((size_t)tf->n_heads * unified_seq * unified_seq * sizeof(float));
+#else
         tf->work_attn = (float *)malloc((size_t)unified_seq * unified_seq * sizeof(float));
+#endif
         tf->work_ffn = (float *)malloc((size_t)unified_seq * tf->ffn_dim * 2 * sizeof(float));
         if (!tf->work_x || !tf->work_tmp || !tf->work_qkv || !tf->work_attn || !tf->work_ffn) {
             free(tf->work_x); tf->work_x = NULL;
@@ -1865,9 +1995,30 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         cap_pos[s * 3 + 2] = 0;       /* W */
     }
 
+    /* Build attention masks: 1 = real token, 0 = padding.
+     * Prevents padding positions from being attended to (sets logits to -inf).
+     * Only allocated when padding is present; NULL means no masking. */
+    int *img_mask = NULL;
+    if (img_pad > 0) {
+        img_mask = (int *)malloc(img_padded * sizeof(int));
+        if (img_mask) {
+            for (int s = 0; s < img_seq; s++) img_mask[s] = 1;
+            for (int s = img_seq; s < img_padded; s++) img_mask[s] = 0;
+        }
+    }
+
+    int *cap_mask = NULL;
+    if (cap_pad > 0) {
+        cap_mask = (int *)malloc(cap_padded * sizeof(int));
+        if (cap_mask) {
+            for (int s = 0; s < cap_seq_len; s++) cap_mask[s] = 1;
+            for (int s = cap_seq_len; s < cap_padded; s++) cap_mask[s] = 0;
+        }
+    }
+
     /* 5. Noise refiner: image-only self-attention with modulation */
     for (int i = 0; i < tf->n_refiner; i++) {
-        zi_block_forward(img_emb, &tf->noise_refiner[i], img_pos, NULL,
+        zi_block_forward(img_emb, &tf->noise_refiner[i], img_pos, img_mask,
                           t_emb, img_padded, tf);
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, i, refiner_total);
@@ -1875,11 +2026,14 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
 
     /* 6. Context refiner: caption-only self-attention without modulation */
     for (int i = 0; i < tf->n_refiner; i++) {
-        zi_block_forward(cap_emb, &tf->context_refiner[i], cap_pos, NULL,
+        zi_block_forward(cap_emb, &tf->context_refiner[i], cap_pos, cap_mask,
                           NULL, cap_padded, tf);
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, tf->n_refiner + i, refiner_total);
     }
+
+    free(img_mask);
+    free(cap_mask);
 
     /* 7. Build unified sequence: [image_tokens, caption_tokens] */
     float *unified = tf->work_x;
@@ -1900,15 +2054,28 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
     free(img_pos);
     free(cap_pos);
 
+    /* Unified attention mask: real image tokens, img padding, real cap tokens, cap padding */
+    int *unified_mask = NULL;
+    if (img_pad > 0 || cap_pad > 0) {
+        unified_mask = (int *)malloc(unified_seq * sizeof(int));
+        if (unified_mask) {
+            for (int s = 0; s < img_seq; s++) unified_mask[s] = 1;
+            for (int s = img_seq; s < img_padded; s++) unified_mask[s] = 0;
+            for (int s = 0; s < cap_seq_len; s++) unified_mask[img_padded + s] = 1;
+            for (int s = cap_seq_len; s < cap_padded; s++) unified_mask[img_padded + s] = 0;
+        }
+    }
+
     /* 8. Main transformer layers */
     for (int i = 0; i < tf->n_layers; i++) {
-        zi_block_forward(unified, &tf->layers[i], unified_pos, NULL,
+        zi_block_forward(unified, &tf->layers[i], unified_pos, unified_mask,
                           t_emb, unified_seq, tf);
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->n_layers);
     }
 
     free(unified_pos);
+    free(unified_mask);
 
     /* 9. Final layer: extract image tokens only, then project */
     float *img_out = (float *)malloc(img_seq * dim * sizeof(float));
