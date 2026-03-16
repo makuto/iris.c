@@ -1995,30 +1995,9 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         cap_pos[s * 3 + 2] = 0;       /* W */
     }
 
-    /* Build attention masks: 1 = real token, 0 = padding.
-     * Prevents padding positions from being attended to (sets logits to -inf).
-     * Only allocated when padding is present; NULL means no masking. */
-    int *img_mask = NULL;
-    if (img_pad > 0) {
-        img_mask = (int *)malloc(img_padded * sizeof(int));
-        if (img_mask) {
-            for (int s = 0; s < img_seq; s++) img_mask[s] = 1;
-            for (int s = img_seq; s < img_padded; s++) img_mask[s] = 0;
-        }
-    }
-
-    int *cap_mask = NULL;
-    if (cap_pad > 0) {
-        cap_mask = (int *)malloc(cap_padded * sizeof(int));
-        if (cap_mask) {
-            for (int s = 0; s < cap_seq_len; s++) cap_mask[s] = 1;
-            for (int s = cap_seq_len; s < cap_padded; s++) cap_mask[s] = 0;
-        }
-    }
-
     /* 5. Noise refiner: image-only self-attention with modulation */
     for (int i = 0; i < tf->n_refiner; i++) {
-        zi_block_forward(img_emb, &tf->noise_refiner[i], img_pos, img_mask,
+        zi_block_forward(img_emb, &tf->noise_refiner[i], img_pos, NULL,
                           t_emb, img_padded, tf);
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, i, refiner_total);
@@ -2026,14 +2005,11 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
 
     /* 6. Context refiner: caption-only self-attention without modulation */
     for (int i = 0; i < tf->n_refiner; i++) {
-        zi_block_forward(cap_emb, &tf->context_refiner[i], cap_pos, cap_mask,
+        zi_block_forward(cap_emb, &tf->context_refiner[i], cap_pos, NULL,
                           NULL, cap_padded, tf);
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, tf->n_refiner + i, refiner_total);
     }
-
-    free(img_mask);
-    free(cap_mask);
 
     /* 7. Build unified sequence: [image_tokens, caption_tokens] */
     float *unified = tf->work_x;
@@ -2054,28 +2030,15 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
     free(img_pos);
     free(cap_pos);
 
-    /* Unified attention mask: real image tokens, img padding, real cap tokens, cap padding */
-    int *unified_mask = NULL;
-    if (img_pad > 0 || cap_pad > 0) {
-        unified_mask = (int *)malloc(unified_seq * sizeof(int));
-        if (unified_mask) {
-            for (int s = 0; s < img_seq; s++) unified_mask[s] = 1;
-            for (int s = img_seq; s < img_padded; s++) unified_mask[s] = 0;
-            for (int s = 0; s < cap_seq_len; s++) unified_mask[img_padded + s] = 1;
-            for (int s = cap_seq_len; s < cap_padded; s++) unified_mask[img_padded + s] = 0;
-        }
-    }
-
     /* 8. Main transformer layers */
     for (int i = 0; i < tf->n_layers; i++) {
-        zi_block_forward(unified, &tf->layers[i], unified_pos, unified_mask,
+        zi_block_forward(unified, &tf->layers[i], unified_pos, NULL,
                           t_emb, unified_seq, tf);
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->n_layers);
     }
 
     free(unified_pos);
-    free(unified_mask);
 
     /* 9. Final layer: extract image tokens only, then project */
     float *img_out = (float *)malloc(img_seq * dim * sizeof(float));
